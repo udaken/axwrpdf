@@ -57,6 +57,7 @@ using namespace Microsoft::WRL::Wrappers;
 static HMODULE g_hModule = nullptr;
 IPdfPage *_p = nullptr;
 bool getAccurateSize = false;
+float scaling = 2.0;
 
 // エラーコード
 #define SPI_SUCCESS			0		// 正常終了
@@ -374,6 +375,20 @@ HRESULT GetPdfDocument(LPCSTR buf, long len, bool isMemory, TCallback action)
 						HStringReference(RuntimeClass_Windows_Data_Pdf_PdfPageRenderOptions).Get(), &renderOptions));
 					GUID encoderId;
 					CHECK_HR(renderOptions->get_BitmapEncoderId(&encoderId));
+					if (scaling != 1.0)
+					{
+						UINT32 height;
+						UINT32 width;
+						CHECK_HR(renderOptions->get_DestinationHeight(&height));
+						CHECK_HR(renderOptions->get_DestinationWidth(&width));
+
+						height = static_cast<UINT32>(height * scaling);
+						width = static_cast<UINT32>(width * scaling);
+
+						CHECK_HR(renderOptions->put_DestinationHeight(height));
+						CHECK_HR(renderOptions->put_DestinationWidth(width));
+					}
+
 					CHECK_HR(GetExtensionFromEncoder(encoderId, ext, _countof(ext)));
 				}
 
@@ -644,168 +659,3 @@ int __stdcall GetFile(LPCSTR buf, long len, LPSTR dest, unsigned int flag, FARPR
 	}
 	return (int)HresultToSpiResult(hr);
 }
-
-HRESULT PdfRender(LPCWSTR filePath)
-{
-	HRESULT hr;
-	try
-	{
-		ComPtr<IPdfDocument> doc;
-		ComPtr<IAsyncOperation<PdfDocument*>> async;
-		Waiter w;
-		{
-			ComPtr<IRandomAccessStream> inStream;
-			CHECK_HR(CreateRandomAccessStreamOnFile(
-				filePath, FileAccessMode_Read, IID_PPV_ARGS(&inStream)));
-
-			ComPtr<IPdfDocumentStatics> pdfDocumentsStatics;
-			CHECK_HR(Windows::Foundation::GetActivationFactory(
-				HStringReference(RuntimeClass_Windows_Data_Pdf_PdfDocument).Get(), &pdfDocumentsStatics));
-
-			CHECK_HR(pdfDocumentsStatics->LoadFromStreamAsync(inStream.Get(), &async));
-		}
-		auto callback = Callback<IAsyncOperationCompletedHandler<PdfDocument*>>(
-			[&](_In_ IAsyncOperation<PdfDocument*>* pdfAsync, AsyncStatus status)
-		{
-			if (status == AsyncStatus::Started)
-				return S_FALSE;
-
-			std::shared_ptr<void> x(((Event&)w).Get(), ::SetEvent);
-
-			if (status != AsyncStatus::Completed)
-				return S_FALSE;
-
-			try
-			{
-				hr = pdfAsync->GetResults(&doc);
-
-				bool useFile = true;
-				UINT count;
-				CHECK_HR(doc->get_PageCount(&count));
-
-				struct PageInfo
-				{
-					UINT pageIndex;
-					HGLOBAL hGlobal;
-					ComPtr<IAsyncAction> async;
-				};
-
-				ComPtr<IPdfPageRenderOptions> renderOptions;
-				WCHAR ext[MAX_PATH];
-				{
-					CHECK_HR(Windows::Foundation::ActivateInstance(
-						HStringReference(RuntimeClass_Windows_Data_Pdf_PdfPageRenderOptions).Get(), &renderOptions));
-					GUID encoderId;
-					CHECK_HR(renderOptions->get_BitmapEncoderId(&encoderId));
-					CHECK_HR(GetExtensionFromEncoder(encoderId, ext, _countof(ext)));
-				}
-
-				std::vector<PageInfo> pages(count);
-				std::vector<HANDLE> waitevents(count);
-
-				for (UINT i = count - 1; i < count; i++)
-				{
-					ComPtr<IStream> outStream;
-					HGLOBAL hGlobal = nullptr;
-					if (useFile)
-					{
-						CHECK_HR(::SHCreateStreamOnFileEx((L"page" + std::to_wstring(i) + L".png").c_str(), STGM_WRITE | STGM_CREATE, FILE_ATTRIBUTE_NORMAL, TRUE, nullptr, &outStream));
-					}
-					else
-					{
-						CHECK_HR(::CreateStreamOnHGlobal(NULL, FALSE, &outStream));
-						CHECK_HR(::GetHGlobalFromStream(outStream.Get(), &hGlobal));
-					}
-
-					auto callback = Callback<IAsyncActionCompletedHandler>([&waitevents, i](IAsyncAction* async, AsyncStatus status)
-					{
-						std::shared_ptr<void> x(waitevents[i], ::SetEvent);
-						OutputDebugString((L"Start " + std::to_wstring(i) + L"\n").c_str());
-						if (status != AsyncStatus::Completed)
-						{
-							return S_FALSE;
-						}
-						OutputDebugString((L"End " + std::to_wstring(i) + L"\n").c_str());
-						return S_OK;
-					});
-					waitevents[i] = ::CreateEventEx(nullptr, nullptr, 0, EVENT_ALL_ACCESS);
-
-					ComPtr<IRandomAccessStream> stream;
-					CHECK_HR(AsRandomAccessStream(outStream.Get(), &stream));
-
-					ComPtr<ABI::Windows::Data::Pdf::IPdfPage> page;
-					CHECK_HR(doc->GetPage(i, &page));
-					ComPtr<IAsyncAction> async;
-					CHECK_HR(page->RenderToStreamAsync(stream.Get(), &async));
-					if (i == count - 1)
-					{
-						REFCOUNT_DEBUG(page.Get());
-						page.Get()->AddRef();// TODO なぜか参照カウントを増やさないと終了時にアクセス違反が発生する。
-						_p = page.Get();
-						//workaroundRef = page.Get();
-						REFCOUNT_DEBUG(page.Get());
-					}
-					CHECK_HR(async->put_Completed(callback.Get()));
-
-					//pages.emplace_back(PageInfo{ i, hGlobal, std::move(async), });
-				}
-
-				::WaitForMultipleObjects(waitevents.size(), &waitevents.front(), TRUE, INFINITE);
-				std::for_each(waitevents.begin(), waitevents.end(), [](HANDLE h) {::CloseHandle(h); });
-				return hr;
-
-				for (auto i : pages)
-				{
-					CHECK_HR(i.async->GetResults());
-					if (useFile)
-					{
-					}
-					else
-					{
-						assert(GlobalSize(i.hGlobal));
-						auto p = (const BYTE*)::GlobalLock(i.hGlobal);
-						printf("%02X %02X \n", p[0], p[1]);
-						GlobalFree(i.hGlobal);
-					}
-				}
-				return hr;
-			}
-			catch (const _com_error &e)
-			{
-				return hr;
-			}
-		});
-		CHECK_HR(async->put_Completed(callback.Get()));
-		w.Wait(60 * 1000);
-
-		//if (_p) _p->Release(), _p = nullptr;
-		return hr;
-	}
-	catch (const _com_error &e)
-	{
-		return e.Error();
-	}
-}
-
-int WINAPI wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int cmdShow)
-{
-	//ATLENSURE_SUCCEEDED(RoInitialize(RO_INIT_SINGLETHREADED));
-	CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
-
-	HRESULT hr;
-	std::thread worker([&] {
-		RoInitializeWrapper init(RO_INIT_MULTITHREADED);
-		hr = init;
-		if (FAILED(hr)) return;
-
-		hr = PdfRender(L"sample.pdf");
-		//CoFreeUnusedLibrariesEx(0, 0);
-		Sleep(10000);
-		//CoFreeUnusedLibrariesEx(0, 0);
-
-	});
-	worker.join();
-	return 0;
-
-}
-
