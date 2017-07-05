@@ -15,10 +15,13 @@ OS以外には依存ファイルがないので、外部ライブラリ等は不
 - 処理を高速化するために、各ページの画像ファイルのサイズは1バイトとして報告します。(展開するときに実サイズがわかります)
 この仕様により、Massigra,Leeyesは表示できるようですが、NeeViewではエラーになってしまいます。
 
+## ダウンロード
+[https://github.com/udaken/axwrpdf/releases](https://github.com/udaken/axwrpdf/releases)
+
 ## 謝辞
 こちらの情報が大変参考になりました。
 
-- http://dev.activebasic.com/egtra/2015/12/24/853/
+- [Direct2DでPDFを描画するAPIを使ってみた - イグトランスの頭の中](http://dev.activebasic.com/egtra/2015/12/24/853/)
 
 
 
