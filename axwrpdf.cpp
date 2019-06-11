@@ -17,6 +17,7 @@
 #include <assert.h>
 #include <wincodec.h>
 #include <comdef.h>
+#include <safeint.h>
 
 #include <windows.storage.h>
 #include <windows.storage.streams.h>
@@ -53,11 +54,11 @@ using namespace Microsoft::WRL::Wrappers;
 
 #define REFCOUNT_DEBUG(async)  OutputDebugString((L"<<" L#async L">>ref count: " + std::to_wstring((async->AddRef(), async->Release())) + L"\n").c_str())
 
+#define AXWRPDF_USE_THUNK_THREAD
 
 static HMODULE g_hModule = nullptr;
-IPdfPage *_p = nullptr;
-bool getAccurateSize = false;
-float scaling = 2.0;
+static bool getAccurateSize = false;
+static float scaling = 2.0;
 
 // エラーコード
 #define SPI_SUCCESS			0		// 正常終了
@@ -126,51 +127,9 @@ enum class SpiResult
 	InternalError = SPI_INTERNAL_ERR,
 };
 
-APTTYPE GetCurrentThreadApartmentType()
+inline HRESULT AsRandomAccessStream(IStream* src, _Outptr_ IRandomAccessStream** stream, BSOS_OPTIONS option = BSOS_DEFAULT) noexcept
 {
-	APTTYPE           apttype;
-	IComThreadingInfo *pComThreadingInfo;
-
-	HRESULT hr = ::CoGetObjectContext(IID_PPV_ARGS(&pComThreadingInfo));
-
-	hr = pComThreadingInfo->GetCurrentApartmentType(&apttype);
-
-	hr = pComThreadingInfo->Release();
-	return apttype;
-}
-
-inline HRESULT CreateMemoryStream(_Outptr_ IRandomAccessStream** stream)
-{
-	HRESULT hr;
-	hr = Windows::Foundation::ActivateInstance(
-		HStringReference(RuntimeClass_Windows_Storage_Streams_InMemoryRandomAccessStream).Get(),
-		stream);
-	return hr;
-}
-
-inline HRESULT CreateMemoryStream(_Outptr_ IStream** stream)
-{
-	HRESULT hr;
-	ComPtr<IRandomAccessStream> abiStream;
-	hr = Windows::Foundation::ActivateInstance(
-		HStringReference(RuntimeClass_Windows_Storage_Streams_InMemoryRandomAccessStream).Get(),
-		&abiStream);
-
-	if (SUCCEEDED(hr))
-	{
-		hr = ::CreateStreamOverRandomAccessStream(abiStream.Get(), IID_PPV_ARGS(stream));
-	}
-	return hr;
-}
-
-HRESULT AsRandomAccessStream(IStream* src, _Outptr_ IRandomAccessStream **stream, BSOS_OPTIONS option = BSOS_DEFAULT)
-{
-	return CreateRandomAccessStreamOverStream(src, option, IID_PPV_ARGS(stream));
-}
-
-HRESULT AsStream(IRandomAccessStream *src, _Outptr_ IStream** stream)
-{
-	return CreateStreamOverRandomAccessStream(src, IID_PPV_ARGS(stream));
+	return ::CreateRandomAccessStreamOverStream(src, option, IID_PPV_ARGS(stream));
 }
 
 class Waiter
@@ -179,13 +138,13 @@ class Waiter
 
 public:
 	Waiter()
-		: m_event(::CreateEventEx(NULL, NULL, CREATE_EVENT_MANUAL_RESET, EVENT_ALL_ACCESS))
+		: m_event(::CreateEventEx(nullptr, nullptr, CREATE_EVENT_MANUAL_RESET, EVENT_ALL_ACCESS))
 	{
 	}
 
 	void Set()
 	{
-		SetEvent(m_event.Get());
+		::SetEvent(m_event.Get());
 	}
 	HANDLE GetHandle()
 	{
@@ -193,9 +152,9 @@ public:
 	}
 	void Reset()
 	{
-		ResetEvent(m_event.Get());
+		::ResetEvent(m_event.Get());
 	}
-	operator Event&()
+	operator Event& ()
 	{
 		return m_event;
 	}
@@ -213,7 +172,7 @@ public:
 };
 
 
-HRESULT GetExtensionFromEncoder(REFGUID encoderId, WCHAR *fileExtensions, UINT cchfileExtensions)
+inline HRESULT GetExtensionFromEncoder(REFGUID encoderId, WCHAR* fileExtensions, UINT cchfileExtensions) noexcept
 {
 	HRESULT hr;
 	ComPtr<IWICBitmapEncoder> encoder;
@@ -229,15 +188,18 @@ HRESULT GetExtensionFromEncoder(REFGUID encoderId, WCHAR *fileExtensions, UINT c
 	if (FAILED(hr)) return hr;
 
 	auto sep = wcschr(fileExtensions, L';');
-	if (sep) *sep = L'\0';
+	if (sep)
+	{
+		*sep = L'\0';
+	}
 
 	return S_OK;
 }
 
 
-int __stdcall GetPluginInfo(int infono, LPSTR buf, int buflen)
+EXTERN_C int __stdcall GetPluginInfo(int infono, LPSTR buf, int buflen)
 {
-	if (buf == NULL || buflen <= 0)
+	if (buf == nullptr || buflen <= 0)
 	{
 		return 0;
 	}
@@ -262,15 +224,28 @@ int __stdcall GetPluginInfo(int infono, LPSTR buf, int buflen)
 	return 0;
 }
 
-int __stdcall IsSupported(LPSTR filename, void* dw)
+EXTERN_C int __stdcall IsSupported(LPSTR filename, void* dw)
 {
+	BYTE buf[2048 + 1] = {};
+	if (HIWORD(dw) == 0) // file handle
+	{
+		if (::ReadFile(dw, buf, _countof(buf), nullptr, nullptr))
+		{
+			dw = buf;
+		}
+		if (::GetLastError() != ERROR_MORE_DATA)
+		{
+			return FALSE;
+		}
+	}
+
 	if (memcmp(dw, "%PDF-", 5) == 0)
 		return TRUE;
 
 	return FALSE;
 }
 
-inline SpiResult HresultToSpiResult(HRESULT hr)
+inline SpiResult HresultToSpiResult(HRESULT hr) noexcept
 {
 	switch (hr)
 	{
@@ -290,7 +265,7 @@ inline SpiResult HresultToSpiResult(HRESULT hr)
 	}
 }
 
-void GetPdfPage(IPdfPage *page, IStream *outStream, HANDLE hCompleteEvent)
+inline void GetPdfPage(IPdfPage* page, IStream* outStream, HANDLE hCompleteEvent)
 {
 	UINT i;
 	CHECK_HR(page->get_Index(&i));
@@ -309,12 +284,40 @@ void GetPdfPage(IPdfPage *page, IStream *outStream, HANDLE hCompleteEvent)
 	ComPtr<IRandomAccessStream> stream;
 	CHECK_HR(AsRandomAccessStream(outStream, &stream));
 
+	ComPtr<IPdfPageRenderOptions> renderOptions;
+	CHECK_HR(Windows::Foundation::ActivateInstance(
+		HStringReference(RuntimeClass_Windows_Data_Pdf_PdfPageRenderOptions).Get(), &renderOptions));
+
+	if (scaling != 1.0)
+	{
+		Size size;
+		CHECK_HR(page->get_Size(&size));
+		UINT32 height = static_cast<UINT32>(size.Height * scaling);
+		UINT32 width = static_cast<UINT32>(size.Width * scaling);
+
+		CHECK_HR(renderOptions->put_DestinationHeight(height));
+		CHECK_HR(renderOptions->put_DestinationWidth(width));
+	}
+
 	ComPtr<IAsyncAction> async;
-	CHECK_HR(page->RenderToStreamAsync(stream.Get(), &async));
+	CHECK_HR(page->RenderWithOptionsToStreamAsync(stream.Get(), renderOptions.Get(), &async));
 	CHECK_HR(async->put_Completed(callback.Get()));
 }
 
-inline void PdfPageToFileInfo(IPdfPage *page, UINT index, fileInfo &fileInfo, LPCSTR ext, SIZE_T filesize)
+inline SIZE_T GetPdfPageSize(IPdfPage* page)
+{
+	Waiter w;
+	ComPtr<IStream> memoryStream;
+	CHECK_HR(::CreateStreamOnHGlobal(nullptr, TRUE, &memoryStream));
+	GetPdfPage(page, memoryStream.Get(), w.GetHandle());
+	w.Wait();
+
+	HGLOBAL hGlobal = nullptr;
+	CHECK_HR(::GetHGlobalFromStream(memoryStream.Get(), &hGlobal));
+	return ::GlobalSize(hGlobal);
+}
+
+inline void PdfPageToFileInfo(IPdfPage* page, UINT index, fileInfo& fileInfo, LPCSTR ext, SIZE_T filesize) noexcept
 {
 	memcpy(fileInfo.method, "PDF", 3);
 	fileInfo.position = index;
@@ -324,10 +327,10 @@ inline void PdfPageToFileInfo(IPdfPage *page, UINT index, fileInfo &fileInfo, LP
 	sprintf_s(fileInfo.filename, "%08u%s", index, ext);
 	fileInfo.crc = 0;
 }
+
 template<class TCallback>
-HRESULT GetPdfDocument(LPCSTR buf, long len, bool isMemory, TCallback action)
+HRESULT GetPdfDocument(LPCSTR buf, LONG_PTR len, bool isMemory, TCallback action)
 {
-	HRESULT hr;
 	try
 	{
 		ComPtr<IPdfDocument> doc;
@@ -352,6 +355,7 @@ HRESULT GetPdfDocument(LPCSTR buf, long len, bool isMemory, TCallback action)
 			//return S_OK;
 			CHECK_HR(pdfDocumentsStatics->LoadFromStreamAsync(inStream.Get(), &async));
 		}
+		HRESULT hr;
 		auto callback = Callback<IAsyncOperationCompletedHandler<PdfDocument*>>(
 			[&](_In_ IAsyncOperation<PdfDocument*>* pdfAsync, AsyncStatus status)
 		{
@@ -367,7 +371,6 @@ HRESULT GetPdfDocument(LPCSTR buf, long len, bool isMemory, TCallback action)
 			{
 				CHECK_HR(pdfAsync->GetResults(&doc));
 
-				bool useFile = true;
 				ComPtr<IPdfPageRenderOptions> renderOptions;
 				WCHAR ext[MAX_PATH];
 				{
@@ -375,87 +378,68 @@ HRESULT GetPdfDocument(LPCSTR buf, long len, bool isMemory, TCallback action)
 						HStringReference(RuntimeClass_Windows_Data_Pdf_PdfPageRenderOptions).Get(), &renderOptions));
 					GUID encoderId;
 					CHECK_HR(renderOptions->get_BitmapEncoderId(&encoderId));
-					if (scaling != 1.0)
-					{
-						UINT32 height;
-						UINT32 width;
-						CHECK_HR(renderOptions->get_DestinationHeight(&height));
-						CHECK_HR(renderOptions->get_DestinationWidth(&width));
-
-						height = static_cast<UINT32>(height * scaling);
-						width = static_cast<UINT32>(width * scaling);
-
-						CHECK_HR(renderOptions->put_DestinationHeight(height));
-						CHECK_HR(renderOptions->put_DestinationWidth(width));
-					}
-
 					CHECK_HR(GetExtensionFromEncoder(encoderId, ext, _countof(ext)));
 				}
 
 				hr = action(doc.Get(), ext);
 				return hr;
 			}
-			catch (const _com_error &e)
+			catch (const _com_error& e)
 			{
-				return hr;
+				return e.Error();
 			}
 		});
 		CHECK_HR(async->put_Completed(callback.Get()));
 		w.Wait(60 * 1000);
 
-		//if (_p) _p->Release(), _p = nullptr;
 		return hr;
 	}
-	catch (const _com_error &e)
+	catch (const _com_error& e)
 	{
 		return e.Error();
 	}
 }
 
-HRESULT GetArchiveInfoInternal(LPCSTR buf, long len, unsigned int flag, HLOCAL * lphInf)
+HRESULT GetArchiveInfoInternal(LPCSTR buf, LONG_PTR len, unsigned int flag, HLOCAL* lphInf)
 {
 	if (lphInf == nullptr)
 	{
 		return E_INVALIDARG;
 	}
-	HRESULT hr = GetPdfDocument(buf, len, flag & 0b000111, [&](IPdfDocument *doc, const WCHAR(&ext)[MAX_PATH])
+	HRESULT hr = GetPdfDocument(buf, len, flag & 0b000111, [&](IPdfDocument* doc, const WCHAR(&ext)[MAX_PATH])
 	{
 		try
 		{
 			UINT count;
 			CHECK_HR(doc->get_PageCount(&count));
 
-			std::shared_ptr<fileInfo> fileList(new fileInfo[count + 1](), std::default_delete<fileInfo[]>());
+			UINT countPlusOne;
+			if (!msl::utilities::SafeAdd(count, 1u, countPlusOne))
+			{
+				return E_OUTOFMEMORY;
+			}
+
+			auto mem = ::LocalAlloc(LMEM_ZEROINIT, sizeof(fileInfo) * countPlusOne);
+			if (mem == nullptr)
+				return E_OUTOFMEMORY;
+
+			std::unique_ptr<fileInfo[], decltype(&::LocalFree) > fileList(reinterpret_cast<fileInfo*>(mem), &::LocalFree);
 
 			for (UINT i = 0; i < count; i++)
 			{
 				ComPtr<IPdfPage> page;
 				CHECK_HR(doc->GetPage(i, &page));
 
-				SIZE_T fileSize = 1;
-				if (getAccurateSize)
-				{
-					Waiter w;
-					ComPtr<IStream> memoryStream;
-					CHECK_HR(::CreateStreamOnHGlobal(NULL, TRUE, &memoryStream));
-					GetPdfPage(page.Get(), memoryStream.Get(), w.GetHandle());
-					w.Wait();
+				SIZE_T fileSize = getAccurateSize ? GetPdfPageSize(page.Get()) : 1;
 
-					HGLOBAL hGlobal = nullptr;
-					CHECK_HR(::GetHGlobalFromStream(memoryStream.Get(), &hGlobal));
-					fileSize = ::GlobalSize(hGlobal);
-				}
-
-				PdfPageToFileInfo(page.Get(), i, fileList.get()[i], w2string(ext).c_str(), fileSize);
+				PdfPageToFileInfo(page.Get(), i, fileList[i], w2string(ext).c_str(), fileSize);
 			}
-			auto mem = ::LocalAlloc(LMEM_ZEROINIT, sizeof(fileInfo) * count + 1);
-			memcpy(mem, fileList.get(), sizeof(fileInfo) * count + 1);
 
-			*lphInf = mem;
+			*lphInf = fileList.release();
 
 			return S_OK;
 		}
-		catch (const _com_error &e)
+		catch (const _com_error& e)
 		{
 			return e.Error();
 		}
@@ -465,78 +449,67 @@ HRESULT GetArchiveInfoInternal(LPCSTR buf, long len, unsigned int flag, HLOCAL *
 		}
 	});
 
-	//if (_p) _p->Release(), _p = nullptr;
 	return hr;
 }
 
-int __stdcall GetArchiveInfo(LPCSTR buf, long len, unsigned int flag, HLOCAL * lphInf)
+EXTERN_C int __stdcall GetArchiveInfo(LPCSTR buf, LONG_PTR len, unsigned int flag, HLOCAL* lphInf) noexcept
 {
 	HRESULT hr;
 	try
 	{
+#ifdef AXWRPDF_USE_THUNK_THREAD
 		std::thread worker([&] {
 			RoInitializeWrapper init(RO_INIT_MULTITHREADED);
 			hr = init;
 			if (FAILED(hr)) return;
-
+#endif
 			hr = GetArchiveInfoInternal(buf, len, flag, lphInf);
-			CoFreeUnusedLibrariesEx(0, 0);
+#ifdef AXWRPDF_USE_THUNK_THREAD
 		});
 		worker.join();
+#endif
 	}
-	catch (const _com_error &err)
+	catch (const _com_error& err)
 	{
 		hr = err.Error();
 	}
 	return (int)HresultToSpiResult(hr);
 }
-HRESULT GetFileInfoInternal(LPCSTR buf, long len, LPSTR filename, unsigned int flag, fileInfo * lpInfo)
+HRESULT GetFileInfoInternal(LPCSTR buf, LONG_PTR len, LPCSTR filename, unsigned int flag, fileInfo* lpInfo)
 {
-	HRESULT hr = GetPdfDocument(buf, len, flag & 0b000111, [&](IPdfDocument *doc, const WCHAR(&ext)[MAX_PATH])
+	HRESULT hr = GetPdfDocument(buf, len, flag & 0b000111, [&](IPdfDocument* doc, const WCHAR(&ext)[MAX_PATH])
 	{
 		try
 		{
 			UINT count;
 			CHECK_HR(doc->get_PageCount(&count));
-			UINT i = len;
 			if (len >= count)
 			{
 				return E_INVALIDARG;
 			}
+			UINT index = len;
 
 			ComPtr<ABI::Windows::Data::Pdf::IPdfPage> page;
-			CHECK_HR(doc->GetPage(i, &page));
+			CHECK_HR(doc->GetPage(index, &page));
 
+#if 0 // NVIDIA Dispaly Driver 26.21.14.3527より前だと、プロセス終了時になぜかヒープ破損が発生していた。
 			if (i == count - 1)
 			{
 				REFCOUNT_DEBUG(page.Get());
-				//page.Get()->AddRef();// TODO なぜか参照カウントを増やさないと終了時にアクセス違反が発生する。
-				_p = page.Get();
+				page.Get()->AddRef();// TODO なぜか参照カウントを増やさないと終了時にアクセス違反が発生する。
 				//workaroundRef = page.Get();
 				REFCOUNT_DEBUG(page.Get());
 			}
+#endif
 
-			SIZE_T fileSize = 1;
-			if (getAccurateSize)
-			{
-				Waiter w;
-				ComPtr<IStream> memoryStream;
-				CHECK_HR(::CreateStreamOnHGlobal(NULL, TRUE, &memoryStream));
-				GetPdfPage(page.Get(), memoryStream.Get(), w.GetHandle());
-				w.Wait();
+			SIZE_T fileSize = getAccurateSize ? GetPdfPageSize(page.Get()) : 1;
 
-				HGLOBAL hGlobal = nullptr;
-				CHECK_HR(::GetHGlobalFromStream(memoryStream.Get(), &hGlobal));
-				fileSize = ::GlobalSize(hGlobal);
-			}
-
-			PdfPageToFileInfo(page.Get(), i, *lpInfo, w2string(ext).c_str(), fileSize);
-
+			PdfPageToFileInfo(page.Get(), index, *lpInfo, w2string(ext).c_str(), fileSize);
+			
 			return S_OK;
 		}
-		catch (const _com_error &e)
+		catch (const _com_error& e)
 		{
-			hr = e.Error();
 			return e.Error();
 		}
 		catch (const std::bad_alloc&)
@@ -545,24 +518,25 @@ HRESULT GetFileInfoInternal(LPCSTR buf, long len, LPSTR filename, unsigned int f
 		}
 	});
 
-	//if (_p) _p->Release(), _p = nullptr;
 	return hr;
 }
 
-int __stdcall GetFileInfo(LPCSTR buf, long len, LPSTR filename, unsigned int flag, fileInfo * lpInfo)
+EXTERN_C int __stdcall GetFileInfo(LPCSTR buf, LONG_PTR len, LPCSTR filename, unsigned int flag, fileInfo* lpInfo) noexcept
 {
 	HRESULT hr;
 	try
 	{
+#ifdef AXWRPDF_USE_THUNK_THREAD
 		std::thread worker([&] {
 			RoInitializeWrapper init(RO_INIT_MULTITHREADED);
 			hr = init;
 			if (FAILED(hr)) return;
-
+#endif
 			hr = GetFileInfoInternal(buf, len, filename, flag, lpInfo);
-			CoFreeUnusedLibrariesEx(0, 0);
+#ifdef AXWRPDF_USE_THUNK_THREAD
 		});
 		worker.join();
+#endif
 	}
 	catch (const std::exception&)
 	{
@@ -571,49 +545,51 @@ int __stdcall GetFileInfo(LPCSTR buf, long len, LPSTR filename, unsigned int fla
 	return (int)HresultToSpiResult(hr);
 }
 
-HRESULT GetFileInternal(LPCSTR buf, long len, LPSTR dest, unsigned int flag, FARPROC progressCallback, intptr_t lData)
+HRESULT GetFileInternal(LPCSTR buf, LONG_PTR len, LPSTR dest, unsigned int flag, FARPROC /*progressCallback*/, intptr_t /*lData*/)
 {
 	const bool useFile = (flag & 0b0000011100000000) == 0;
-	HRESULT hr = GetPdfDocument(buf, len, flag & 0b000111, [&](IPdfDocument *doc, const WCHAR(&ext)[MAX_PATH])
+	HRESULT hr = GetPdfDocument(buf, len, flag & 0b000111, [&](IPdfDocument* doc, const WCHAR(&ext)[MAX_PATH])
 	{
 		try
 		{
 			UINT count;
 			CHECK_HR(doc->get_PageCount(&count));
-			UINT i = len;
 			if (len >= count)
 			{
 				return E_INVALIDARG;
 			}
+			UINT index = len;
 
 			ComPtr<IStream> outStream;
 			if (useFile)
 			{
-				WCHAR path[MAX_PATH];
-				swprintf_s(path, L"%S\\%08u%s", buf, i, ext);
+				WCHAR path[MAX_PATH] = {};
+				swprintf_s(path, L"%S\\%08u%s", buf, index, ext);
 				CHECK_HR(::SHCreateStreamOnFileEx(path, STGM_WRITE | STGM_CREATE, FILE_ATTRIBUTE_NORMAL, TRUE, nullptr, &outStream));
 			}
 			else
 			{
-				CHECK_HR(::CreateStreamOnHGlobal(NULL, FALSE, &outStream));
+				CHECK_HR(::CreateStreamOnHGlobal(nullptr, FALSE, &outStream));
 			}
 			Waiter w;
 			ComPtr<ABI::Windows::Data::Pdf::IPdfPage> page;
-			CHECK_HR(doc->GetPage(i, &page));
+			CHECK_HR(doc->GetPage(index, &page));
 			GetPdfPage(page.Get(), outStream.Get(), w.GetHandle());
 
+#if 0 // NVIDIA Dispaly Driver 26.21.14.3527より前だと、プロセス終了時になぜかヒープ破損が発生していた。
 			if (i == count - 1)
 			{
 				REFCOUNT_DEBUG(page.Get());
 				page.Get()->AddRef();// TODO なぜか参照カウントを増やさないと終了時にアクセス違反が発生する。
-				_p = page.Get();
 				//workaroundRef = page.Get();
 				REFCOUNT_DEBUG(page.Get());
 			}
+#endif
 
 			w.Wait();
 			if (useFile)
 			{
+				// nothing
 			}
 			else
 			{
@@ -623,9 +599,8 @@ HRESULT GetFileInternal(LPCSTR buf, long len, LPSTR dest, unsigned int flag, FAR
 			}
 			return S_OK;
 		}
-		catch (const _com_error &e)
+		catch (const _com_error& e)
 		{
-			hr = e.Error();
 			return e.Error();
 		}
 		catch (const std::bad_alloc&)
@@ -634,24 +609,26 @@ HRESULT GetFileInternal(LPCSTR buf, long len, LPSTR dest, unsigned int flag, FAR
 		}
 	});
 
-	//if (_p) _p->Release(), _p = nullptr;
 	return hr;
 }
 
-int __stdcall GetFile(LPCSTR buf, long len, LPSTR dest, unsigned int flag, FARPROC progressCallback, intptr_t lData)
+EXTERN_C int __stdcall GetFile(LPCSTR buf, LONG_PTR len, LPSTR dest, unsigned int flag, FARPROC progressCallback, intptr_t lData) noexcept
 {
 	HRESULT hr;
 	try
 	{
+#ifdef AXWRPDF_USE_THUNK_THREAD
 		std::thread worker([&] {
 			RoInitializeWrapper init(RO_INIT_MULTITHREADED);
 			hr = init;
 			if (FAILED(hr)) return;
-
+#endif
 			hr = GetFileInternal(buf, len, dest, flag, progressCallback, lData);
-			CoFreeUnusedLibrariesEx(0, 0);
+#ifdef AXWRPDF_USE_THUNK_THREAD
 		});
+
 		worker.join();
+#endif
 	}
 	catch (const std::exception&)
 	{
