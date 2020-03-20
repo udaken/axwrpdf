@@ -486,7 +486,7 @@ HRESULT GetFileInfoInternal(LPCSTR buf, LONG_PTR len, LPCSTR filename, unsigned 
 			CHECK_HR(doc->get_PageCount(&count));
 
 			UINT index = count;
-			sscanf_s(PathFindFileNameA(filename), "%08u", &index);
+			sscanf_s(filename, "%08u", &index);
 
 			if (index >= count)
 			{
