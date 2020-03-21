@@ -319,13 +319,14 @@ inline SIZE_T GetPdfPageSize(IPdfPage* page)
 
 inline void PdfPageToFileInfo(IPdfPage* page, UINT index, fileInfo& fileInfo, LPCSTR ext, SIZE_T filesize) noexcept
 {
-	memcpy(fileInfo.method, "PDF", 3);
+	memcpy(fileInfo.method, "PDF\0", 4);
 	fileInfo.position = index;
 	fileInfo.compsize = filesize;
 	fileInfo.filesize = filesize;
 	fileInfo.timestamp = static_cast<susie_time_t>(std::time(nullptr));
 	sprintf_s(fileInfo.filename, "%08u%s", index, ext);
 	fileInfo.crc = 0;
+	fileInfo.path[0] = NULL;
 }
 
 template<class TCallback>
@@ -483,11 +484,14 @@ HRESULT GetFileInfoInternal(LPCSTR buf, LONG_PTR len, LPCSTR filename, unsigned 
 		{
 			UINT count;
 			CHECK_HR(doc->get_PageCount(&count));
-			if (len >= count)
+
+			UINT index = count;
+			sscanf_s(filename, "%08u", &index);
+
+			if (index >= count)
 			{
 				return E_INVALIDARG;
 			}
-			UINT index = len;
 
 			ComPtr<ABI::Windows::Data::Pdf::IPdfPage> page;
 			CHECK_HR(doc->GetPage(index, &page));
